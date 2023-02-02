@@ -1,0 +1,1258 @@
+/* eslint-disable prefer-promise-reject-errors */
+import React, { useState, useEffect } from 'react';
+import {
+    Row,
+    Col,
+    Typography,
+    Tag,
+    Form,
+    Input,
+    Button,
+    Alert,
+    notification,
+} from 'antd';
+import moment from 'moment';
+import { hasErrors, Tags } from '../helpers';
+import StatusFeedback from './StatusFeedback';
+import { MessageBus } from '@ivoyant/component-message-bus';
+import { cache } from '@ivoyant/component-cache';
+
+const { Text } = Typography;
+
+const isLuhn = (value) => {
+    let nCheck = 0;
+    let bEven = false;
+    const newValue = value.replace(/\D/g, '');
+    for (let n = newValue.length - 1; n >= 0; n--) {
+        const cDigit = newValue.charAt(n);
+        let nDigit = parseInt(cDigit, 10);
+        if (bEven && (nDigit *= 2) > 9) nDigit -= 9;
+        nCheck += nDigit;
+        bEven = !bEven;
+    }
+    return nCheck % 10 == 0;
+};
+
+const isValidIMEI = (imei) => {
+    return imei.trim().length === 15 && isLuhn(imei.trim());
+};
+
+const isValidSIM = (sim) => {
+    return (
+        sim.match(/^(89)(01)(150|030|170|410|560|680)(\d{13})/g) != null &&
+        isLuhn(sim)
+    );
+};
+
+function UpdateOrder({ order, workflows, datasources, fetchLastSearchOrder }) {
+    const [form] = Form.useForm();
+    const [loading, setLoading] = useState(false);
+    const [showConfirmation, setShowConfirmation] = useState(false);
+    const [errorMsg, setErrorMsg] = useState();
+    const [formValues, setFormValues] = useState({});
+
+    const {
+        orderId,
+        billingAccountNumber,
+        firstName,
+        lastName,
+        orderStepStatus,
+        orderTrackingStatusInfo,
+        orderDate,
+        lines,
+        internalOrderTrackingStatusInfo,
+        uuid,
+        otherAccountNumber,
+        otherAccountPin,
+        ssn,
+        taxId,
+        zipcode,
+        customerTelephoneNumber,
+    } = order;
+
+    const simRequired = internalOrderTrackingStatusInfo?.simRequired;
+    const allowLinesInfo = internalOrderTrackingStatusInfo?.lines.find(
+        ({ lineActions }) => lineActions?.updateSim || lineActions?.updateImei
+    );
+
+    const allowLinesPortInInfo =
+        orderStepStatus === 'INPROGRESS' &&
+        internalOrderTrackingStatusInfo?.lines.find(
+            ({ lineStep, lineStepStatus }) =>
+                lineStep === 'PORTIN' && lineStepStatus === 'RESOLUTIONREQ'
+        );
+
+    const disableSimImei = orderStepStatus !== 'CREATED' && !allowLinesInfo;
+
+    useEffect(() => {
+        return () => {
+            sessionStorage.removeItem('orderFormValues');
+        };
+    }, []);
+
+    useEffect(() => {
+        let formValuesObject = { ...formValues };
+        if (cache.get('portEdit')) {
+            let formFieldsObj = {};
+            formFieldsObj[`${otherAccountNumber}-accNum`] = otherAccountNumber;
+            formFieldsObj[`${otherAccountNumber}-pin`] = otherAccountPin;
+            formFieldsObj[`${otherAccountNumber}-ssn`] = ssn;
+            formFieldsObj[`${otherAccountNumber}-taxId`] = taxId;
+            formFieldsObj[`${otherAccountNumber}-zipcode`] = zipcode;
+
+            form.setFieldsValue(formFieldsObj);
+
+            const formErrors = form.getFieldsError();
+            const showValidate = !formErrors
+                ?.filter(
+                    ({ name }) =>
+                        name?.includes(`${customerTelephoneNumber}-sim`) ||
+                        name?.includes(`${customerTelephoneNumber}-imei`)
+                )
+                ?.find(({ errors }) => errors?.length > 0);
+
+            formValuesObject = {
+                ...formValuesObject,
+                ...formFieldsObj,
+                otherAccountNumber,
+                otherAccountPin,
+                ssn,
+                taxId,
+                zipcode,
+            };
+        }
+        if (!cache.get('portEdit')) {
+            lines.forEach((currentLine) => {
+                const {
+                    newDeviceInfo,
+                    newSimInfo,
+                    portInDetails,
+                    customerTelephoneNumber,
+                } = currentLine;
+
+                const { imei } = newDeviceInfo;
+                const { sim } = newSimInfo;
+                // let otherAccountNumber = '';
+                // let otherAccountPin = '';
+                // let taxId = '';
+                // let otherAccountNumber = '';
+                const {
+                    otherAccountNumber = '',
+                    otherAccountPin = '',
+                    taxId = '',
+                    zipcode = '',
+                } = portInDetails || {};
+
+                let formFieldsObj = {};
+                formFieldsObj[`${customerTelephoneNumber}-sim`] = getValue(sim);
+                formFieldsObj[`${customerTelephoneNumber}-imei`] = getValue(
+                    imei
+                );
+                formFieldsObj[
+                    `${customerTelephoneNumber}-passcode`
+                ] = otherAccountPin;
+                formFieldsObj[
+                    `${customerTelephoneNumber}-accNum`
+                ] = otherAccountNumber;
+                formFieldsObj[`${customerTelephoneNumber}-zipcode`] = zipcode;
+                formFieldsObj[`${customerTelephoneNumber}-ssn`] = taxId;
+
+                form.setFieldsValue(formFieldsObj);
+
+                const formErrors = form.getFieldsError();
+                const showValidate = !formErrors
+                    ?.filter(
+                        ({ name }) =>
+                            name?.includes(`${customerTelephoneNumber}-sim`) ||
+                            name?.includes(`${customerTelephoneNumber}-imei`)
+                    )
+                    ?.find(({ errors }) => errors?.length > 0);
+                formValuesObject[customerTelephoneNumber] = {
+                    ...formValuesObject[customerTelephoneNumber],
+                    showValidate,
+                    sim,
+                    imei,
+                    otherAccountPin,
+                    otherAccountNumber,
+                    zipcode,
+                    taxId,
+                };
+            });
+        }
+        setFormValues(formValuesObject);
+    }, [order]);
+
+    const onFinish = () => {
+        setErrorMsg('');
+        setLoading(true);
+
+        if (cache.get('portEdit')) {
+            handleUpdatePortInDetail();
+        } else {
+            let requestBody = {
+                billingAccountNumber,
+            };
+
+            let portDetails = [];
+            let linesInfo = [];
+
+            if (Object.keys(formValues).length) {
+                Object.entries(formValues).forEach(([key, value]) => {
+                    if (value?.sim || value?.imei) {
+                        linesInfo.push({
+                            ctn: key,
+                            sim: value?.sim,
+                            imei: value?.imei,
+                        });
+                    }
+                    if (
+                        value?.otherAccountPin ||
+                        value?.otherAccountNumber ||
+                        value?.zipcode
+                    ) {
+                        if (value?.sim || value?.imei) {
+                            delete value?.sim;
+                            delete value?.imei;
+                        }
+                        portDetails.push({
+                            ctn: key,
+                            portDetails: {
+                                ...value,
+                                taxId: value?.taxId ? value?.taxId : 9999,
+                            },
+                        });
+                    }
+                });
+                if (linesInfo.length > 0) {
+                    requestBody = {
+                        ...requestBody,
+                        linesEquipmentInfo: linesInfo,
+                    };
+                }
+                if (portDetails.length > 0) {
+                    requestBody = {
+                        ...requestBody,
+                        portDetailsInfo: portDetails,
+                    };
+                }
+            }
+            if (linesInfo?.length > 0) {
+                postValidateCall(linesInfo, requestBody);
+            } else {
+                handleUpdateOrder(requestBody);
+            }
+        }
+    };
+
+    const postValidateCall = (linesInfo, requestBody) => {
+        const {
+            workflow,
+            datasource,
+            responseMapping,
+            successStates,
+            errorStates,
+        } = workflows?.validateAddLine;
+        const currentValues = linesInfo[0];
+        const registrationId = workflow.concat(`.${currentValues?.ctn}`);
+        if (
+            checkValuePresence(currentValues?.imei) ||
+            (simRequired && checkValuePresence(currentValues?.sim))
+        ) {
+            notification['error']({
+                message: `Valid SIM and IMEI`,
+                description: 'Valid SIM and IMEI is Required',
+            });
+            setLoading(false);
+        } else {
+            let payloadObj = {
+                imei: currentValues?.imei,
+            };
+            if (
+                simRequired ||
+                (currentValues?.sim !== '' && isValidSIM(currentValues?.sim))
+            )
+                payloadObj = { ...payloadObj, iccid: currentValues?.sim };
+            MessageBus.send('WF.'.concat(workflow).concat('.INIT'), {
+                header: {
+                    registrationId: registrationId,
+                    workflow: workflow,
+                    eventType: 'INIT',
+                },
+            });
+            const newLines = linesInfo?.filter(
+                ({ ctn }) => ctn !== currentValues?.ctn
+            );
+
+            MessageBus.subscribe(
+                registrationId,
+                'WF.'.concat(workflow).concat('.STATE.CHANGE'),
+                collectValidateResponse(
+                    currentValues?.ctn,
+                    requestBody,
+                    workflow,
+                    newLines,
+                    successStates,
+                    errorStates
+                )
+            );
+
+            MessageBus.send('WF.'.concat(workflow).concat('.SUBMIT'), {
+                header: {
+                    registrationId: registrationId,
+                    workflow: workflow,
+                    eventType: 'SUBMIT',
+                },
+                body: {
+                    datasource: datasources[datasource],
+                    request: {
+                        body: {
+                            ...payloadObj,
+                        },
+                    },
+                    responseMapping,
+                },
+            });
+        }
+    };
+
+    const updateValueForPortInDetails = (subs, portDetails) => {
+        let subIndex = subs?.findIndex(
+            (sb) =>
+                sb?.subscriberDetails?.phoneNumber === customerTelephoneNumber
+        );
+        if (subIndex !== -1)
+            subs[subIndex].subscriberDetails.portDetails = {
+                ...subs[subIndex].subscriberDetails.portDetails,
+                ...portDetails,
+            };
+    };
+
+    const updateLocalAlasqlCustomerAdditionalInfo = (portDetails) => {
+        let subscribersFromAlasqlTable = window[sessionStorage?.tabId]?.alasql(
+            'select subscribers as subscribers from datasource_360_customer_additional_info'
+        );
+        let subs = subscribersFromAlasqlTable[0].subscribers;
+        updateValueForPortInDetails(subs, portDetails);
+        window[
+            sessionStorage?.tabId
+        ]?.alasql(
+            'update datasource_360_customer_additional_info set subscribers=?',
+            [subs]
+        );
+        fetchLastSearchOrder();
+    };
+
+    const handleUpdatePortInDetailResponse = (successStates, errorStates) => (
+        subscriptionId,
+        topic,
+        eventData,
+        closure
+    ) => {
+        const state = eventData.value;
+        const isSuccess = successStates.includes(state);
+        const isFailure = errorStates.includes(state);
+        if (isSuccess || isFailure) {
+            if (isSuccess) {
+                const responsePayload = eventData?.event.data?.data;
+                setErrorMsg('');
+                setShowConfirmation(true);
+                updateLocalAlasqlCustomerAdditionalInfo(responsePayload);
+            } else if (isFailure) {
+                // On Error display the pop up with error
+                setErrorMsg(
+                    eventData?.event?.data?.message ||
+                        'Error updating the order!'
+                );
+            }
+
+            setLoading(false);
+            MessageBus.unsubscribe(subscriptionId);
+        }
+    };
+
+    /** Calls the update port in details api*/
+    const handleUpdatePortInDetail = () => {
+        const {
+            workflow,
+            datasource,
+            successStates,
+            errorStates,
+            responseMapping,
+        } = workflows?.updatePortInDetails;
+        if ('showValidate' in formValues) delete formValues['showValidate'];
+        MessageBus.send('WF.'.concat(workflow).concat('.INIT'), {
+            header: {
+                registrationId: workflow,
+                workflow,
+                eventType: 'INIT',
+            },
+        });
+
+        MessageBus.subscribe(
+            workflow,
+            'WF.'.concat(workflow).concat('.STATE.CHANGE'),
+            handleUpdatePortInDetailResponse(successStates, errorStates),
+            {}
+        );
+
+        MessageBus.send('WF.'.concat(workflow).concat('.').concat('SUBMIT'), {
+            header: {
+                registrationId: workflow,
+                workflow,
+                eventType: 'SUBMIT',
+            },
+            body: {
+                datasource: datasources[datasource],
+                request: {
+                    body: { ...formValues },
+                    params: {
+                        ctn: customerTelephoneNumber,
+                    },
+                },
+                responseMapping,
+            },
+        });
+    };
+
+    const checkValuePresence = (vl) => {
+        return vl === '' || vl < 1 || vl.split('').every((st) => st === '0');
+    };
+
+    /** Calls the update the order api*/
+    const handleUpdateOrder = (requestBody) => {
+        const {
+            workflow,
+            datasource,
+            successStates,
+            errorStates,
+            responseMapping,
+        } = workflows?.updateOrder;
+        const sim = requestBody?.linesEquipmentInfo[0]?.sim;
+        if (!simRequired && checkValuePresence(sim))
+            delete requestBody?.linesEquipmentInfo[0]?.sim;
+
+        MessageBus.send('WF.'.concat(workflow).concat('.INIT'), {
+            header: {
+                registrationId: workflow,
+                workflow,
+                eventType: 'INIT',
+            },
+        });
+
+        MessageBus.subscribe(
+            workflow,
+            'WF.'.concat(workflow).concat('.STATE.CHANGE'),
+            handleUpdateOrderResponse(successStates, errorStates),
+            {}
+        );
+
+        MessageBus.send('WF.'.concat(workflow).concat('.').concat('SUBMIT'), {
+            header: {
+                registrationId: workflow,
+                workflow,
+                eventType: 'SUBMIT',
+            },
+            body: {
+                datasource: datasources[datasource],
+                request: {
+                    body: requestBody,
+                    params: { uuid: uuid },
+                },
+                responseMapping,
+            },
+        });
+    };
+
+    // Collecting the validate response for add a line and updating the states and calling getPlansAndAddOns
+    const collectValidateResponse = (
+        number,
+        requestBody,
+        workflow,
+        newLines,
+        successStates,
+        errorStates
+    ) => (subscriptionId, topic, eventData, closure) => {
+        const status = eventData.value;
+        const isSuccess = successStates.includes(status);
+        const isFailure = errorStates.includes(status);
+        if (isSuccess || isFailure) {
+            if (isSuccess && subscriptionId === workflow.concat(`.${number}`)) {
+                const responsePayload = JSON.parse(
+                    eventData?.event?.data?.request?.response
+                );
+                const simError =
+                    responsePayload?.iccidValidationResult?.faultInfo;
+                const imeiError =
+                    responsePayload?.imeiValidationResult?.faultInfo;
+                const rateCenterError = responsePayload?.rateCenter?.faultInfo;
+                const formPrevValues = sessionStorage?.getItem(
+                    'orderFormValues'
+                )
+                    ? JSON.parse(sessionStorage?.getItem('orderFormValues'))
+                    : {};
+                if (simError || imeiError || rateCenterError) {
+                    let responseErrors = formPrevValues?.formErrors || [];
+                    if (simError) {
+                        responseErrors.push({
+                            name: `${number}-sim`,
+                            errors: simError ? [simError?.message] : null,
+                        });
+                    }
+                    if (imeiError) {
+                        responseErrors.push({
+                            name: `${number}-imei`,
+                            errors: imeiError ? [imeiError?.message] : null,
+                        });
+                    }
+                    sessionStorage?.setItem(
+                        'orderFormValues',
+                        JSON.stringify({
+                            ...formPrevValues,
+                            formErrors: responseErrors,
+                        })
+                    );
+                    form.setFields(responseErrors);
+                } else {
+                    let values = formPrevValues?.validatedLines || [];
+                    if (!values?.includes(number)) {
+                        values.push(number);
+                        sessionStorage?.setItem(
+                            'orderFormValues',
+                            JSON.stringify({
+                                ...formPrevValues,
+                                validatedLines: values,
+                            })
+                        );
+                    }
+                    if (
+                        values?.length ===
+                        requestBody?.linesEquipmentInfo?.length
+                    ) {
+                        handleUpdateOrder(requestBody);
+                    }
+                }
+            }
+            MessageBus.unsubscribe(subscriptionId);
+            if (newLines?.length > 0) {
+                postValidateCall(newLines, requestBody);
+            } else {
+                sessionStorage?.removeItem('orderFormValues');
+                setLoading(false);
+            }
+        }
+    };
+
+    const handleUpdateOrderResponse = (successStates, errorStates) => (
+        subscriptionId,
+        topic,
+        eventData,
+        closure
+    ) => {
+        const state = eventData.value;
+        const isSuccess = successStates.includes(state);
+        const isFailure = errorStates.includes(state);
+        if (isSuccess || isFailure) {
+            if (isSuccess) {
+                const responsePayload = eventData?.event.data?.data;
+                if (
+                    (responsePayload?.linesEquipmentFaultInfo?.length > 0 &&
+                        responsePayload?.linesEquipmentFaultInfo[0]
+                            ?.equipmentFaultInfo) ||
+                    (responsePayload?.linesPortInFaultInfo?.length > 0 &&
+                        responsePayload?.linesPortInFaultInfo[0]?.faultInfo)
+                ) {
+                    let lineErrorMessage = '';
+                    let portErrorMessage = '';
+                    if (
+                        responsePayload?.linesPortInFaultInfo?.length > 0 &&
+                        responsePayload?.linesPortInFaultInfo[0]?.faultInfo
+                    ) {
+                        portErrorMessage = responsePayload?.linesPortInFaultInfo
+                            ?.map(
+                                ({ ctn, faultInfo }) =>
+                                    `${ctn} : ${faultInfo?.message}`
+                            )
+                            ?.join('. ');
+                    }
+                    if (
+                        responsePayload?.linesEquipmentFaultInfo?.length > 0 &&
+                        responsePayload?.linesEquipmentFaultInfo[0]
+                            ?.equipmentFaultInfo
+                    ) {
+                        lineErrorMessage = responsePayload?.linesEquipmentFaultInfo
+                            ?.map(
+                                ({ ctn, equipmentFaultInfo }) =>
+                                    `${ctn} : ${equipmentFaultInfo?.map(
+                                        ({ message }) => message
+                                    )}`
+                            )
+                            ?.join('. ');
+                        responsePayload?.linesEquipmentFaultInfo[0]
+                            ?.equipmentFaultInfo[0]?.message;
+                    }
+                    let errorMessage = `${
+                        portErrorMessage ? portErrorMessage : ''
+                    }  ${lineErrorMessage ? lineErrorMessage : ''}`;
+
+                    setErrorMsg(
+                        portErrorMessage || lineErrorMessage
+                            ? errorMessage
+                            : 'Error updating the order!'
+                    );
+                } else {
+                    setErrorMsg('');
+                    setShowConfirmation(true);
+                }
+            }
+
+            // On Error display the pop up with error
+            if (isFailure) {
+                setErrorMsg(
+                    eventData?.event?.data?.message ||
+                        'Error updating the order!'
+                );
+            }
+            setLoading(false);
+            MessageBus.unsubscribe(subscriptionId);
+        }
+    };
+
+    const customValidator = (rule, value) => {
+        if (rule.field?.includes('sim')) {
+            return !value || isValidSIM(value)
+                ? Promise.resolve()
+                : Promise.reject(
+                      !value ? 'Please enter SIM' : 'Please enter a valid SIM'
+                  );
+        }
+        if (rule.field?.includes('imei')) {
+            return !value || isValidIMEI(value)
+                ? Promise.resolve()
+                : Promise.reject(
+                      !value ? 'Please enter IMEI' : 'Please enter a valid IMEI'
+                  );
+        }
+    };
+
+    const onFinishFailed = (errorInfo) => {};
+
+    const first = [
+        {
+            label: 'Order ID',
+            value: orderId,
+        },
+        {
+            label: 'Account Number',
+            value: billingAccountNumber,
+        },
+        {
+            label: 'Account Name',
+            value: `${lastName}, ${firstName}`,
+        },
+        {
+            label: 'Date',
+            value: moment(orderDate).format('YYYY-MM-DD'),
+        },
+        {
+            label: 'Status',
+            value: orderStepStatus,
+        },
+    ];
+
+    const portEditFields = [
+        {
+            label: 'Other Account Number',
+            value: otherAccountNumber,
+        },
+        {
+            label: 'Pin',
+            value: otherAccountPin,
+        },
+        {
+            label: 'SSN',
+            value: ssn,
+        },
+        {
+            label: 'Tax ID',
+            value: taxId,
+        },
+        {
+            label: 'Zipcode',
+            value: zipcode,
+        },
+    ];
+
+    const handleField = (value, name, phoneNumber) => {
+        const formErrors = form.getFieldsError();
+        const showValidate = !formErrors
+            ?.filter(
+                ({ name }) =>
+                    name?.includes(`${phoneNumber}-sim`) ||
+                    name?.includes(`${phoneNumber}-imei`)
+            )
+            ?.find(({ errors }) => errors?.length > 0);
+        if (cache.get('portEdit')) {
+            setFormValues({
+                ...formValues,
+                [name]: value,
+                showValidate: showValidate,
+            });
+        } else {
+            setFormValues({
+                ...formValues,
+                [phoneNumber]: {
+                    ...formValues[phoneNumber],
+                    showValidate: showValidate,
+                    [name]: value,
+                },
+            });
+        }
+    };
+
+    const renderFields = () => {
+        if (cache.get('portEdit')) {
+            return portEditFields.map(({ label, value }) => (
+                <Row style={{ margin: '8px 0' }} key={label}>
+                    <Col span={12} style={{ textAlign: 'right' }}>
+                        <Text type="secondary" style={{ marginRight: 12 }}>
+                            {label}:
+                        </Text>
+                    </Col>
+                    {label === 'Status' ? (
+                        <Tag color={Tags[value]?.color}>
+                            {Tags[value]?.title}
+                        </Tag>
+                    ) : (
+                        <Col span={12}>
+                            <Text strong>{value}</Text>
+                        </Col>
+                    )}
+                </Row>
+            ));
+        } else {
+            return first.map(({ label, value }) => (
+                <Row style={{ margin: '8px 0' }} key={label}>
+                    <Col span={12} style={{ textAlign: 'right' }}>
+                        <Text type="secondary" style={{ marginRight: 12 }}>
+                            {label}:
+                        </Text>
+                    </Col>
+                    {label === 'Status' ? (
+                        <Tag color={Tags[value]?.color}>
+                            {Tags[value]?.title}
+                        </Tag>
+                    ) : (
+                        <Col span={12}>
+                            <Text strong>{value}</Text>
+                        </Col>
+                    )}
+                </Row>
+            ));
+        }
+    };
+
+    const getValue = (vl) => {
+        return vl < 1 || vl.split('').every((st) => st === '0') ? '' : vl;
+    };
+    const getOrderFormFields = (
+        customerTelephoneNumber,
+        updateSim,
+        updateImei,
+        allowPortInfo,
+        index
+    ) => {
+        const currentLine = lines[index];
+
+        const { newDeviceInfo, newSimInfo, portInDetails } = currentLine;
+
+        const { imei } = newDeviceInfo;
+        const { sim } = newSimInfo;
+        const {
+            otherAccountNumber = '',
+            otherAccountPin = '',
+            taxId = '',
+            zipcode = '',
+        } = portInDetails || {};
+
+        return (
+            <>
+                <Row gutter={24} key={customerTelephoneNumber}>
+                    <Col span={6}>
+                        <Row
+                            style={{
+                                margin: '8px 0',
+                            }}
+                        >
+                            <Col
+                                span={12}
+                                style={{
+                                    textAlign: 'right',
+                                }}
+                            >
+                                <Text
+                                    type="secondary"
+                                    style={{
+                                        marginRight: 12,
+                                    }}
+                                >
+                                    Phone Number :
+                                </Text>
+                            </Col>
+                            <Col span={12}>
+                                <Text strong>{customerTelephoneNumber}</Text>
+                            </Col>
+                        </Row>
+                    </Col>
+                    <Col span={6}>
+                        <Form.Item
+                            label="SIM"
+                            name={`${customerTelephoneNumber}-sim`}
+                            validateTrigger="onChange"
+                            rules={
+                                simRequired
+                                    ? [
+                                          {
+                                              required: updateSim,
+                                              validator: customValidator,
+                                              message:
+                                                  'Please enter a valid SIM.',
+                                          },
+                                      ]
+                                    : false
+                            }
+                            normalize={(value) => value.replace(/[^0-9]/gi, '')}
+                            initialValue={getValue(sim)}
+                        >
+                            <Input
+                                disabled={!updateSim}
+                                autoComplete="off"
+                                onChange={(e) =>
+                                    handleField(
+                                        e.target.value,
+                                        'sim',
+                                        customerTelephoneNumber
+                                    )
+                                }
+                            />
+                        </Form.Item>
+                        <Form.Item
+                            label="IMEI"
+                            name={`${customerTelephoneNumber}-imei`}
+                            validateTrigger="onChange"
+                            rules={[
+                                {
+                                    required: updateImei,
+                                    validator: customValidator,
+                                    message: 'Please enter a valid IMEI.',
+                                },
+                            ]}
+                            normalize={(value) => value.replace(/[^0-9]/gi, '')}
+                            onChange={(e) =>
+                                handleField(
+                                    e.target.value,
+                                    'imei',
+                                    customerTelephoneNumber
+                                )
+                            }
+                            initialValue={getValue(imei)}
+                        >
+                            <Input disabled={!updateImei} autoComplete="off" />
+                        </Form.Item>
+                    </Col>
+                    <Col span={10}>
+                        <Row>
+                            <Col span={10} offset={2}>
+                                <Form.Item
+                                    label="Passcode"
+                                    name={`${customerTelephoneNumber}-passcode`}
+                                    validateTrigger="onBlur"
+                                    rules={[
+                                        {
+                                            required: allowPortInfo
+                                                ? true
+                                                : false,
+                                            message: 'Please enter valid PIN',
+                                        },
+                                    ]}
+                                    normalize={(value) =>
+                                        value.replace(/[^0-9]/gi, '')
+                                    }
+                                    initialValue={otherAccountPin}
+                                >
+                                    <Input
+                                        disabled={!allowPortInfo}
+                                        autoComplete="off"
+                                        maxLength={8}
+                                        minLength={4}
+                                        onChange={(e) =>
+                                            handleField(
+                                                e.target.value,
+                                                'otherAccountPin',
+                                                customerTelephoneNumber
+                                            )
+                                        }
+                                    />
+                                </Form.Item>
+                            </Col>
+                            <Col span={10} offset={2}>
+                                <Form.Item
+                                    label="Account Number"
+                                    name={`${customerTelephoneNumber}-accNum`}
+                                    rules={[
+                                        {
+                                            required: allowPortInfo
+                                                ? true
+                                                : false,
+                                            message:
+                                                'Please enter the Account Number',
+                                        },
+                                    ]}
+                                    normalize={(value) =>
+                                        value.replace(/[^0-9]/gi, '')
+                                    }
+                                    initialValue={otherAccountNumber}
+                                >
+                                    <Input
+                                        disabled={!allowPortInfo}
+                                        autoComplete="off"
+                                        onChange={(e) =>
+                                            handleField(
+                                                e.target.value,
+                                                'otherAccountNumber',
+                                                customerTelephoneNumber
+                                            )
+                                        }
+                                    />
+                                </Form.Item>
+                            </Col>
+                        </Row>
+                        <Row>
+                            <Col span={10} offset={2}>
+                                <Form.Item
+                                    label="Zip Code"
+                                    name={`${customerTelephoneNumber}-zipcode`}
+                                    validateTrigger="onBlur"
+                                    rules={[
+                                        {
+                                            required: allowPortInfo
+                                                ? true
+                                                : false,
+                                            message:
+                                                'Please enter valid zip code',
+                                        },
+                                    ]}
+                                    initialValue={zipcode}
+                                >
+                                    <Input
+                                        disabled={!allowPortInfo}
+                                        minLength={5}
+                                        maxLength={5}
+                                        autoComplete="off"
+                                        onChange={(e) =>
+                                            handleField(
+                                                e.target.value,
+                                                'zipcode',
+                                                customerTelephoneNumber
+                                            )
+                                        }
+                                    />
+                                </Form.Item>
+                            </Col>
+                            <Col span={10} offset={2}>
+                                <Form.Item
+                                    label="Last 4 digits SSN"
+                                    name={`${customerTelephoneNumber}-ssn`}
+                                    normalize={(value) =>
+                                        value.replace(/[^0-9]/gi, '')
+                                    }
+                                    initialValue={taxId}
+                                >
+                                    <Input
+                                        disabled={!allowPortInfo}
+                                        autoComplete="off"
+                                        minLength={4}
+                                        maxLength={4}
+                                        onChange={(e) =>
+                                            handleField(
+                                                e.target.value,
+                                                'taxId',
+                                                customerTelephoneNumber
+                                            )
+                                        }
+                                        type="password"
+                                        className="fs-exclude"
+                                    />
+                                </Form.Item>
+                            </Col>
+                        </Row>
+                    </Col>
+                </Row>
+            </>
+        );
+    };
+
+    const getPortEditFields = () => {
+        return (
+            <>
+                <Row gutter={24} key={otherAccountNumber}>
+                    <Col span={6}>
+                        <Form.Item
+                            label="Account Number"
+                            name={`${otherAccountNumber}-accNum`}
+                            rules={[
+                                {
+                                    required: true,
+                                    message: 'Please enter the Account Number',
+                                },
+                            ]}
+                            normalize={(value) => value.replace(/[^0-9]/gi, '')}
+                            initialValue={otherAccountNumber}
+                        >
+                            <Input
+                                autoComplete="off"
+                                onChange={(e) =>
+                                    handleField(
+                                        e.target.value,
+                                        'otherAccountNumber',
+                                        otherAccountNumber
+                                    )
+                                }
+                            />
+                        </Form.Item>
+                    </Col>
+                    <Col span={6}>
+                        <Form.Item
+                            label="PIN"
+                            name={`${otherAccountNumber}-pin`}
+                            validateTrigger="onBlur"
+                            rules={[
+                                {
+                                    required: true,
+                                    message: 'Please enter valid PIN',
+                                },
+                            ]}
+                            normalize={(value) => value.replace(/[^0-9]/gi, '')}
+                            initialValue={otherAccountPin}
+                        >
+                            <Input
+                                autoComplete="off"
+                                maxLength={8}
+                                minLength={4}
+                                onChange={(e) =>
+                                    handleField(
+                                        e.target.value,
+                                        'otherAccountPin',
+                                        otherAccountNumber
+                                    )
+                                }
+                            />
+                        </Form.Item>
+                    </Col>
+
+                    <Col span={6}>
+                        <Form.Item
+                            label="SSN"
+                            name={`${otherAccountNumber}-ssn`}
+                            normalize={(value) => value.replace(/[^0-9]/gi, '')}
+                            initialValue={ssn}
+                        >
+                            <Input
+                                autoComplete="off"
+                                minLength={4}
+                                maxLength={4}
+                                onChange={(e) =>
+                                    handleField(
+                                        e.target.value,
+                                        'ssn',
+                                        otherAccountNumber
+                                    )
+                                }
+                                type="password"
+                                className="fs-exclude"
+                            />
+                        </Form.Item>
+                    </Col>
+                </Row>
+                <Row gutter={24} key={otherAccountNumber}>
+                    <Col span={6}>
+                        <Form.Item
+                            label="TAX ID"
+                            name={`${otherAccountNumber}-taxId`}
+                            normalize={(value) => value.replace(/[^0-9]/gi, '')}
+                            initialValue={taxId}
+                        >
+                            <Input
+                                autoComplete="off"
+                                minLength={4}
+                                maxLength={4}
+                                onChange={(e) =>
+                                    handleField(
+                                        e.target.value,
+                                        'taxId',
+                                        otherAccountNumber
+                                    )
+                                }
+                                type="password"
+                                className="fs-exclude"
+                            />
+                        </Form.Item>
+                    </Col>
+                    <Col span={6}>
+                        <Form.Item
+                            label="Zip Code"
+                            name={`${otherAccountNumber}-zipcode`}
+                            validateTrigger="onBlur"
+                            rules={[
+                                {
+                                    required: true,
+                                    message: 'Please enter valid zip code',
+                                },
+                            ]}
+                            initialValue={zipcode}
+                        >
+                            <Input
+                                minLength={5}
+                                maxLength={5}
+                                autoComplete="off"
+                                onChange={(e) =>
+                                    handleField(
+                                        e.target.value,
+                                        'zipcode',
+                                        otherAccountNumber
+                                    )
+                                }
+                            />
+                        </Form.Item>
+                    </Col>
+                </Row>
+            </>
+        );
+    };
+    const renderFormFields = () => {
+        if (cache.get('portEdit')) {
+            return getPortEditFields();
+        } else {
+            return internalOrderTrackingStatusInfo?.lines?.map(
+                (
+                    {
+                        customerTelephoneNumber,
+                        lineStepStatus,
+                        lineStep,
+                        lineActions,
+                    },
+                    index
+                ) => {
+                    const updateSim = lineActions?.updateSim;
+                    const updateImei = lineActions?.updateImei;
+                    const allowPortInfo =
+                        lineStep === 'PORTIN' &&
+                        lineStepStatus === 'RESOLUTIONREQ';
+                    if (updateSim || updateImei || allowPortInfo) {
+                        return getOrderFormFields(
+                            customerTelephoneNumber,
+                            updateSim,
+                            updateImei,
+                            allowPortInfo,
+                            index
+                        );
+                    }
+                }
+            );
+        }
+    };
+    const [, forceUpdate] = useState({}); // To disable submit button at the beginning.
+
+    useEffect(() => {
+        forceUpdate({});
+    }, []);
+
+    const renderFormSubmitButton = () => {
+        if (cache.get('portEdit')) {
+            return (
+                <Form.Item shouldUpdate>
+                    {() => (
+                        <Button
+                            block
+                            type="primary"
+                            htmlType="submit"
+                            loading={loading}
+                            disabled={
+                                (disableSimImei && !allowLinesPortInInfo) ||
+                                hasErrors(form.getFieldsError())
+                            }
+                        >
+                            Submit
+                        </Button>
+                    )}
+                </Form.Item>
+            );
+        } else {
+            return (
+                <Form.Item shouldUpdate>
+                    {() => (
+                        <Button
+                            block
+                            type="primary"
+                            htmlType="submit"
+                            loading={loading}
+                            disabled={
+                                (disableSimImei && !allowLinesPortInInfo) ||
+                                hasErrors(form.getFieldsError())
+                            }
+                        >
+                            Submit
+                        </Button>
+                    )}
+                </Form.Item>
+            );
+        }
+    };
+    return (
+        <div className="view-container">
+            {showConfirmation ? (
+                <div
+                    style={{ height: '100%' }}
+                    className="d-flex justify-content-center align-items-center"
+                >
+                    <StatusFeedback
+                        status="success"
+                        msg="Order was updated successfully."
+                    />
+                </div>
+            ) : (
+                <>
+                    <div className="alert-container">
+                        {errorMsg && (
+                            <Alert message={errorMsg} type="error" showIcon />
+                        )}
+                    </div>
+                    <div
+                        style={{
+                            border: '1px solid rgba(0, 0, 0, 0.1)',
+                            padding: '26px 20px',
+                        }}
+                    >
+                        <Col span={6}>{renderFields()}</Col>
+                        <Form
+                            form={form}
+                            layout="vertical"
+                            name="basic"
+                            onFinish={onFinish}
+                            onFinishFailed={onFinishFailed}
+                            className="addALineForm"
+                        >
+                            {renderFormFields()}
+                            <Row gutter={18}>
+                                <Col span={5} offset={19}>
+                                    {renderFormSubmitButton()}
+                                </Col>
+                            </Row>
+                        </Form>
+                    </div>
+                </>
+            )}
+        </div>
+    );
+}
+
+export default UpdateOrder;

@@ -1,0 +1,34 @@
+{
+    "name": "@ivoyant/custom-cricket-trackorder",
+    "version": "1.0.0",
+    "main": "dist/index.js",
+    "title": "Track Order",
+    "description": "",
+    "icon": "icon.png",
+    "scripts": {
+        "start": "ist s",
+        "build": "ist b",
+        "storybook": "ist storybook",
+        "prepublish": "ist b -u"
+    },
+    "files": [
+        "dist",
+        "icon.png"
+    ],
+    "author": "",
+    "license": "",
+    "peerDependencies": {
+        "react": "^18.2.0"
+    },
+    "dependencies": {
+        "@ivoyant/component-loader": "^1.0.39",
+        "@ivoyant/component-message-bus": "^1.0.0",
+        "@storybook/addon-knobs": "^6.4.0",
+        "@storybook/react": "^6.5.15",
+        "lodash.merge": "^4.6.1",
+        "moment": "^2.24.0"
+    },
+    "devDependencies": {
+        "@ivoyant/cli": "^1.1.2"
+    }
+}
